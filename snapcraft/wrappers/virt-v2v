@@ -1,0 +1,47 @@
+#!/bin/sh
+
+run_cmd() {
+    CMD="$1"
+    shift
+
+    unset XDG_RUNTIME_DIR
+    unset LD_LIBRARY_PATH
+
+    export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+    echo "Running:"
+    echo "${CMD} $@"
+
+    # Prepare arguments for 'env' command to avoid complex quoting issues
+    ARGS=""
+    for arg in "$@"; do
+        ARGS="$ARGS '$arg'"
+    done
+
+    # shellcheck disable=SC2145
+    # exec unshare --kill-child -U -m -p -r -f --root="/var/lib/snapd/hostfs/" "/bin/sh" -c "mount -t proc proc /proc 2>/dev/null || true; exec \"${CMD}\" \"$@\""
+    exec unshare --kill-child -U -m -p -r -f --root="/var/lib/snapd/hostfs/" "/bin/sh" -c "mount -t proc proc /proc 2>/dev/null || true; exec ${CMD}${ARGS}"
+}
+
+# Get command base name.
+CMD="$(basename "${0}")"
+
+# Detect base name.
+SNAP_BASE="$(sed -n '/^name:/ s/^name:\s*\(core[0-9]\{2\}\)/\1/p' /meta/snap.yaml)"
+
+USERNS=1
+if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+    grep -qxF 0 /proc/sys/kernel/unprivileged_userns_clone
+    USERNS=0
+fi
+
+
+# If file (or symlink) exists in the /bin, /usr/bin, or /usr/local/bin
+# directory, run it.
+for path in /bin /usr/bin /usr/local/bin; do
+    if [ -e "/var/lib/snapd/hostfs/${path}/${CMD}" ] || [ -L "/var/lib/snapd/hostfs/${path}/${CMD}" ]; then
+        run_cmd "${CMD}" "$@"
+    fi
+done
+
+echo "${CMD} not found: Ensure ${CMD} is installed /bin, /usr/bin, or /usr/local/bin directory"
