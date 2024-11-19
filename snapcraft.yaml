@@ -51,6 +51,7 @@ description: |-
    - openvswitch.external: Use the system's OVS tools (ignores openvswitch.builtin) [default=false]
    - ovn.builtin: Use snap-specific OVN configuration [default=false]
    - ui.enable: Enable the web interface [default=true]
+   - zfs.external: Use the system's ZFS tools [default=false]
 
  For system-wide configuration of the CLI, place your configuration in
  /var/snap/lxd/common/global-conf/ (config.yml and servercerts)
@@ -191,14 +192,19 @@ parts:
       - libatomic
     plugin: nil
     stage-packages:
+      # XXX: explicitly depend on libsnappy1v5 due to https://bugs.launchpad.net/ubuntu/+source/ceph/+bug/2072656
       - on amd64:
         - ceph-common
+        - libsnappy1v5
       - on arm64:
         - ceph-common
+        - libsnappy1v5
       - on ppc64el:
         - ceph-common
+        - libsnappy1v5
       - on s390x:
         - ceph-common
+        - libsnappy1v5
     organize:
       usr/bin/: bin/
       usr/lib/: lib/
@@ -247,12 +253,14 @@ parts:
       - lib/*/librtmp.so*
       - lib/*/libsasl2.so*
       - lib/*/libsnappy.so*
-      - lib/*/libncurses.so*
+      - lib/*/libssh.so*
+      - lib/*/libtcmalloc.so*
+      - lib/*/libunwind.so*
 
   criu:
     source: https://github.com/checkpoint-restore/criu
-    source-depth: 1
-    source-tag: v3.19
+    source-commit: f8b14286b092853a4485813e1efd564109df9123 # v3.19
+    #source-depth: 1
     source-type: git
     plugin: nil
     build-packages:
@@ -278,7 +286,17 @@ parts:
       [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "ppc64le" ] && [ "$(uname -m)" != "s390x" ] && [ "$(uname -m)" != "armv7l" ] && exit 0
       set -ex
 
-      make USERCFLAGS=-Wno-error=format-truncation criu
+      git config user.email "noreply@lists.canonical.com"
+      git config user.name "LXD snap builder"
+
+      # temporary workaround builds on core24
+      sed -i 's/-Wall -Wformat-security/-Wno-error=format -Wformat-security/g' Makefile
+
+      git cherry-pick -x 61828769a2d253a836f116413912176fda29078b # criu: move timers dump/restore code into separate file
+      git cherry-pick -x 7de0b45729842d828a6cd05093bf6246d2f22a3e # criu: use proper format-specified to accommodate time_t 64-bit change
+      git cherry-pick -x b384afa0d965e74e3b09467583aba671253140aa # net: Fix TOCTOU race condition in unix_conf_op
+
+      make criu
       mkdir -p "${CRAFT_PART_INSTALL}/criu/"
       cp criu/criu "${CRAFT_PART_INSTALL}/criu/"
     organize:
@@ -293,7 +311,7 @@ parts:
       - sqlite
     source: https://github.com/canonical/dqlite
     source-depth: 1
-    source-commit: 769a5ae21156ea7b1f01a937f80a3da60eb6a1bb # v1.16.5
+    source-commit: 6339f32a9b15b31163798de309a585927b22025f # v1.18.0
     source-type: git
     plugin: autotools
     autotools-configure-parameters:
@@ -481,8 +499,8 @@ parts:
 
   libtpms:
     source: https://github.com/stefanberger/libtpms
+    source-commit: f8c2dc7e12a730dcca4220d7ac5ad86d13dfd630 # v0.9.6
     source-depth: 1
-    source-tag: v0.9.6
     source-type: git
     plugin: autotools
     autotools-configure-parameters:
@@ -518,8 +536,8 @@ parts:
 
   libusb:
     source: https://github.com/libusb/libusb
+    source-commit: d52e355daa09f17ce64819122cb067b8a2ee0d4b # v1.0.27
     source-depth: 1
-    source-tag: v1.0.27
     source-type: git
     plugin: autotools
     autotools-configure-parameters:
@@ -552,6 +570,25 @@ parts:
       sbin/: bin/
       usr/lib/: lib/
       usr/sbin/: bin/
+    override-build: |-
+      # Patch lvm.conf
+      # lvm.conf changes for lvm2 from 22.04/core22
+      sed -i \
+        -e "s%\(# \)\?obtain_device_list_from_udev = 1%obtain_device_list_from_udev = 0%" \
+        -e "s%\(# \)\?cache_file_prefix = \"\"%cache_file_prefix = \"lxd\"%" \
+        "${CRAFT_PART_INSTALL}/etc/lvm/lvm.conf"
+
+      # Generic lvm.conf changes
+      sed -i \
+        -e "s%\(# \)\?udev_sync = 1%udev_sync = 0%" \
+        -e "s%\(# \)\?udev_rules = 1%udev_rules = 0%" \
+        -e "s%\(# \)\?use_lvmetad = 1%use_lvmetad = 0%" \
+        -e "s%\(# \)\?monitoring = 1%monitoring = 0%" \
+        -e "/# .*_\?executable =/s/# //" \
+        -e "s%\(/usr\)\?/s\?bin/%/snap/lxd/current/bin/%" \
+        "${CRAFT_PART_INSTALL}/etc/lvm/lvm.conf"
+
+      craftctl default
     prime:
       - bin/cache_*
       - bin/dmeventd
@@ -567,6 +604,7 @@ parts:
       - -bin/lvmetad
       - -bin/lvmpolld
       - etc/lvm/lvm.conf
+      - etc/lvm/profile/*
       - lib/*/device-mapper/*
       - lib/*/libaio.so*
       - lib/*/libdevmapper*
@@ -634,12 +672,12 @@ parts:
 
   nvidia-container:
     source: https://github.com/NVIDIA/libnvidia-container
-    source-commit: 63d366ee3b4183513c310ac557bf31b05b83328f # v1.17.1
+    source-commit: 63d366ee3b4183513c310ac557bf31b05b83328f # v1.17.2
     source-depth: 1
     source-type: git
     plugin: make
     build-environment:
-      - GIT_TAG: "1.17.1" # Enables source-depth: 1, should match git tag without "v" prefix.
+      - GIT_TAG: "1.17.2" # Enables source-depth: 1, should match git tag without "v" prefix.
     build-packages:
       - bmake
       - curl
@@ -675,6 +713,32 @@ parts:
     prime:
       - bin/nvidia-container-cli*
       - lib/libnvidia-container*.so*
+
+  nvidia-container-toolkit:
+    source: https://github.com/NVIDIA/nvidia-container-toolkit
+    source-depth: 1
+    source-commit: fa66e4cd562804509055e44a88f666673e6d27c0 # v1.17.2
+    source-type: git
+    build-snaps:
+      - go/1.23/stable
+    plugin: make
+    override-prime: |-
+      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "ppc64le" ] && [ "$(uname -m)" != "s390x" ] && exit 0
+      craftctl default
+    override-pull: |-
+      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "ppc64le" ] && [ "$(uname -m)" != "s390x" ] && exit 0
+      craftctl default
+    override-build: |-
+      [ "$(uname -m)" != "x86_64" ] && [ "$(uname -m)" != "aarch64" ] && [ "$(uname -m)" != "ppc64le" ] && [ "$(uname -m)" != "s390x" ] && exit 0
+      set -ex
+
+      make binaries
+      mkdir -p "${CRAFT_PART_INSTALL}/bin/"
+      cp nvidia-ctk "${CRAFT_PART_INSTALL}/bin/"
+    organize:
+      usr/bin/: bin/
+    prime:
+      - bin/nvidia-ctk
 
   nvme:
     plugin: nil
@@ -727,8 +791,8 @@ parts:
 
   spice-protocol:
     source: https://gitlab.freedesktop.org/spice/spice-protocol
+    source-commit: 6f453a775d87087c6ba59fc180c1a1e466631a47 # v0.14.4
     source-depth: 1
-    source-tag: v0.14.4
     source-type: git
     plugin: meson
     prime: []
@@ -749,8 +813,9 @@ parts:
     after:
       - spice-protocol
     source: https://gitlab.freedesktop.org/spice/spice
-    source-depth: 1
-    source-tag: v0.15.2
+    source-commit: 0c2c1413a8b387ea597a95b6c867470a7c56c8ab # v0.15.2
+    # XXX: source-depth does not work with submodules
+    #source-depth: 1
     source-type: git
     plugin: meson
     meson-parameters:
@@ -1029,8 +1094,8 @@ parts:
 
   squashfs-tools-ng:
     source: https://github.com/AgentD/squashfs-tools-ng
+    source-commit: 8f9966c8ea3ea8a854941d041e7fcb9eb4f772fb # v1.3.1
     source-depth: 1
-    source-tag: v1.3.1
     source-type: git
     plugin: autotools
     autotools-configure-parameters:
@@ -1048,6 +1113,7 @@ parts:
     source-tag: v1.10.1
     source-type: git
     plugin: rust
+    rust-channel: stable
     build-packages:
       - cargo
       - libseccomp-dev
@@ -1119,8 +1185,8 @@ parts:
 
   zfs-2-1:
     source: https://github.com/openzfs/zfs
+    source-commit: fb6d532066f23458f768a97ae94b158c42cbe484 # zfs-2.1.15
     source-depth: 1
-    source-tag: zfs-2.1.15
     source-type: git
     plugin: autotools
     autotools-configure-parameters:
@@ -1154,8 +1220,8 @@ parts:
 
   zfs-2-2:
     source: https://github.com/openzfs/zfs
+    source-commit: baa50314567afd986a00838f0fa65fdacbd12daf # zfs-2.2.6
     source-depth: 1
-    source-tag: zfs-2.2.4
     source-type: git
     plugin: autotools
     autotools-configure-parameters:
@@ -1201,7 +1267,7 @@ parts:
 
   apparmor:
     source: https://gitlab.com/apparmor/apparmor.git
-    source-commit: 84a6bc1b6dcdfeabb1ed3597f01e314f3bcee5c1 # v4.0.2
+    source-commit: b4dfdf50f50ed1d64161424d036a2453645f0cfe # v4.0.3
     source-depth: 1
     source-type: git
     plugin: autotools
@@ -1240,9 +1306,9 @@ parts:
     after:
       - apparmor
     source: https://github.com/lxc/lxc
+    source-commit: 2444f5841444a0a33705e2418727c23c1f167d1e # v6.0.2
     source-depth: 1
     source-type: git
-    source-tag: v6.0.0
     build-packages:
       - dpkg-dev
       - libcap-dev
@@ -1296,9 +1362,9 @@ parts:
 
   lxcfs:
     source: https://github.com/lxc/lxcfs
+    source-commit: 5df434be88d69406985083a2f591278034a7227b # v6.0.2
     source-depth: 1
     source-type: git
-    source-tag: v6.0.0
     build-packages:
       - libfuse3-dev
       - libpam0g-dev
@@ -1353,8 +1419,8 @@ parts:
       - qemu-ovmf-secureboot
       - nftables
     source: https://github.com/awslabs/python-uefivars
+    source-commit: ec1eab1717c65ea36ca7160c96fe0e10e071fb66 # v1.2
     source-depth: 1
-    source-tag: v1.0.0
     source-type: git
     plugin: python
     override-prime: |-
@@ -1368,6 +1434,7 @@ parts:
       craftctl default
     organize:
       lib/python3.10/site-packages/: lib/python3/dist-packages/
+      bin/uefivars: bin/uefivars.py
     prime:
       - bin/uefivars.py
       - lib/python3/dist-packages/google_crc32c*
@@ -1377,7 +1444,7 @@ parts:
     source: https://github.com/canonical/lxd
     # XXX: We often cherry-pick for candidate builds so don't do shallow clone
     #source-depth: 1
-    source-commit: 5a492a3f0036c44d22c344505952e06ce517993a # LXD 6.1
+    source-commit: d1e60042366b1fcd25240b1f26769375b64a8ce5 # Pre LXD 6.2
     source-type: git
     after:
       - lxc
@@ -1398,7 +1465,7 @@ parts:
       - python3-pip
       - python3-venv
     build-snaps:
-      - go/1.22/stable
+      - go/1.23/stable
     stage-packages:
       - acl
       - attr
@@ -1425,7 +1492,7 @@ parts:
       ln -s "$(pwd)" "${GOPATH}/src/github.com/canonical/lxd"
 
       # Download the dependencies
-      go get -d -v ./...
+      go get -v ./...
     override-build: |
       set -ex
 
@@ -1433,22 +1500,6 @@ parts:
       cd ../src
       git config user.email "noreply@lists.canonical.com"
       git config user.name "LXD snap builder"
-
-      git cherry-pick -x 2f7c7cd501d9b1b84daeb4deb95b67ebe3de1193 # lxd/instance/exec: Only use keepalives on TCP sockets
-      git cherry-pick -x 5b44f9a5d9218e60f75ce5abdc6705b11121d1b7 # gomod: Revert github.com/gorilla/websocket to v1.5.1
-      git cherry-pick -x 7e468c7cb5b59e67189d0b7141007303b5f74140 # lxd: Extract certificate add token metadata from remote member
-      git cherry-pick -x af70982132866ffb9feb0f543b625abb238eb17a # lxd: Return an error if the client uses a trust password
-      git cherry-pick -x b551f47dfdd8699772c7b8fd2cfb72fe439ad0c7 # lxd/certificates: Improve expiry validation checks in clusterMemberJoinTokenValid
-      git cherry-pick -x 39f97587a2c30eb59ac78979d7b60e11dfd6132e # lxd/certificates: Improve validation in certificateTokenValid
-      git cherry-pick -x cd43ad507584dc4971c9ce3c8b12167a93fb75b7 # lxd/instance/drivers/driver/common: Fix crash when device doesn't return run config when being live updated
-      git cherry-pick -x 47180a352654bee9a994db714801813a59cfbb18 # lxd/apparmor/feature_check: add infastructure to check AppArmor features
-      git cherry-pick -x b5a4a6540e793120b85a3b280003fce236e6a56f # lxd/apparmor/instance_lxc: allow nosymfollow mount flag
-      git cherry-pick -x 86c3d515662068d825d23387623932bca96bc6aa # lxd/apparmor/instance_lxc: allow nosymfollow mount flag in more cases
-      git cherry-pick -x 69bd88119f5dc990452c79699915b3dd86dad242 # lxd/storage/backend/lxd: Pass full snapshot name when validating import in CreateInstanceFromBackup
-      git cherry-pick -x a35079f481c50adf7dfd571d2c815668f5f747a1 # lxd/instance/instance/utils: Don't allow snapshots named ".." in ValidName
-      git cherry-pick -x fcdc78dda31b210f246e075aaf4bf507b07b68f5 # lxd/instance: if storage location is remote, make cluster self healing available, and vm can migrate when src member is offline also
-      git cherry-pick -x 7ab0a26428590a4d4689b90e8ab95b1523bcc8c5 # lxd/apparmor/instance_lxc: allow procfs for unprivileged containers
-      git cherry-pick -x aebc412682916842c6be51ecff33c40d2d1fbb79 # lxd/apparmor/instance_lxc: allow sysfs for unprivileged containers
 
       # Setup build environment
       export GOPATH="$(realpath ./.go)"
@@ -1459,9 +1510,13 @@ parts:
       # Build the binaries
       go build -trimpath -o "${CRAFT_PART_INSTALL}/bin/lxc" github.com/canonical/lxd/lxc
       go build -trimpath -o "${CRAFT_PART_INSTALL}/bin/lxd" -tags=libsqlite3 github.com/canonical/lxd/lxd
-      CGO_ENABLED=0 go build -trimpath -o "${CRAFT_PART_INSTALL}/bin/lxd-agent" -tags=agent,netgo github.com/canonical/lxd/lxd-agent
-      go build -trimpath -o "${CRAFT_PART_INSTALL}/bin/lxd-user" github.com/canonical/lxd/lxd-user
 
+      # Build static binaries
+      CGO_ENABLED=0 go build -trimpath -o "${CRAFT_PART_INSTALL}/bin/lxd-agent" -tags=agent,netgo github.com/canonical/lxd/lxd-agent
+      CGO_ENABLED=0 go build -trimpath -o "${CRAFT_PART_INSTALL}/bin/lxd-user" -tags netgo github.com/canonical/lxd/lxd-user
+
+      # Some python dependencies are not available for riscv64 or just require a build from source.
+      # Not worth the effort for now.
       if [ "$(uname -m)" != "riscv64" ]; then
         # Build the static website
         make doc
@@ -1472,14 +1527,21 @@ parts:
         rm doc/_build/.buildinfo
         rm -rf doc/_build/_sphinx_design_static/
 
-        # Stage the static website
-        mkdir -p "${CRAFT_STAGE}/share/lxd-documentation"
-        cp -a doc/_build/. "${CRAFT_STAGE}/share/lxd-documentation/"
+        # Copy the static website
+        mkdir -p "${CRAFT_PART_INSTALL}/share/lxd-documentation"
+        cp -a doc/_build/. "${CRAFT_PART_INSTALL}/share/lxd-documentation/"
       fi
 
       # Setup bash completion
       mkdir -p "${CRAFT_PART_INSTALL}/etc/bash_completion.d/"
-      cp scripts/bash/lxd-client "${CRAFT_PART_INSTALL}/etc/bash_completion.d/snap.lxd.lxc"
+      # Snapd requires the unaliased command `lxd.lxc` to be supplied as the first command for completion to be detected
+      set_cmds='s/^\s*complete.*__start_lxc /&lxd.lxc /'
+      # When executed by Snapd, the COLUMNS shell value is unset, so use $(tput cols) instead
+      set_cols='s/COLUMNS/$(tput cols)/'
+      # Modify requestComp variable to use lxc based on context ($SNAP/bin/lxc in Snap environment)
+      set_request_comp='s|requestComp="${words\[0\]} __complete ${args\[\*\]}"|requestComp="/snap/lxd/current/bin/lxc __complete ${args[*]}"|'
+      # Generate completions script
+      "${CRAFT_PART_INSTALL}/bin/lxc" completion bash | sed -e "${set_cmds}" -e "${set_cols}" -e "${set_request_comp}" > "${CRAFT_PART_INSTALL}/etc/bash_completion.d/snap.lxd.lxc"
     organize:
       usr/bin/: bin/
       usr/lib/: lib/
@@ -1502,6 +1564,7 @@ parts:
 
       - etc/bash_completion.d/snap.lxd.lxc
 
+      - share/lxd-documentation*
       - share/misc/pci.ids
       - share/misc/usb.ids
 
@@ -1572,6 +1635,7 @@ parts:
       - criu
       - lxd
       - shmounts
+      - nvidia-container-toolkit
     plugin: nil
     override-prime: |
       set -x
@@ -1591,10 +1655,12 @@ parts:
         -not -path "${CRAFT_PRIME}/bin/remote-viewer" \
         -not -path "${CRAFT_PRIME}/bin/snap-query" \
         -not -path "${CRAFT_PRIME}/bin/sshfs" \
+        -not -path "${CRAFT_PRIME}/bin/virt-v2v-in-place" \
         -not -path "${CRAFT_PRIME}/bin/xfs_admin" \
         -not -path "${CRAFT_PRIME}/bin/uefivars.py" \
         -not -path "${CRAFT_PRIME}/bin/lxcfs" \
-        -exec strip -s {} +
+        -not -path "${CRAFT_PRIME}/bin/gpu-2404-custom-wrapper" \
+        -exec strip --strip-all {} +
 
       # Strip binaries not under bin/ due to being dynamically
       # added to the path with `snap set lxd`, like `criu.enable=true`
@@ -1614,13 +1680,6 @@ parts:
         -not -path "${CRAFT_PRIME}/lib/python3/*" \
         -not -path "${CRAFT_PRIME}/lib/liblxcfs.so" \
         -exec strip -s {} +
-
-      if [ "$(uname -m)" != "riscv64" ]; then
-          # Prime the documentation only if the arch is not riscv64.
-          # Some python dependencies are not available for riscv64 or just require a build from source.
-          # Not worth the effort for now.
-          cp -r "${CRAFT_STAGE}/share/lxd-documentation" "${CRAFT_PRIME}/share/"
-      fi
 
       # Delete empty directories
       find "${CRAFT_PRIME}/" -type d -empty -print -delete
@@ -1647,3 +1706,4 @@ parts:
       wrappers/editor: bin/
       wrappers/remote-viewer: bin/
       wrappers/sshfs: bin/
+      wrappers/virt-v2v-in-place: bin/
