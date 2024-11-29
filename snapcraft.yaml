@@ -1507,6 +1507,8 @@ parts:
       git config user.email "noreply@lists.canonical.com"
       git config user.name "LXD snap builder"
 
+      git cherry-pick a014ad5514ee753d602b55ebce6f743a2efdbe5a # lxd/instance/drivers/driver/qemu: Fix nvram file update from 2MB OVMF and CSM mode
+
       # Setup build environment
       export GOPATH="$(realpath ./.go)"
       export CGO_CFLAGS="-I${CRAFT_STAGE}/include/ -I${CRAFT_STAGE}/usr/local/include/"
